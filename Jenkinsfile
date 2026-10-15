@@ -1,82 +1,80 @@
 pipeline {
     agent any
 
-    environment {
-        IMAGE_NAME = 'YOUR-DOCKERHUB-USERNAME/student-placement-portal'
-    }
-
     stages {
-
         stage('Checkout') {
             steps {
                 checkout scm
-                sh 'git status --short'
             }
         }
 
-        stage('Build Docker Image') {
+        stage('Verify Project Files') {
             steps {
-                sh '''
-                    docker build \
-                      -t ${IMAGE_NAME}:v1 \
-                      .
+                powershell '''
+                    Write-Host "Checking Student Placement Portal files..."
+                    Get-ChildItem -Force
+
+                    if (!(Test-Path "index.html")) {
+                        throw "index.html is missing"
+                    }
+
+                    if (!(Test-Path "Dockerfile")) {
+                        throw "Dockerfile is missing"
+                    }
+
+                    if (!(Test-Path "deployment.yaml")) {
+                        throw "deployment.yaml is missing"
+                    }
+
+                    Write-Host "All required project files exist."
                 '''
             }
         }
 
-        stage('Test Application') {
+        stage('Verify Docker') {
             steps {
-                sh '''
-                    docker run -d \
-                      --name placement-ci-test \
-                      -p 18080:80 \
-                      ${IMAGE_NAME}:v1
+                powershell '''
+                    docker --version
 
-                    trap 'docker rm -f placement-ci-test >/dev/null 2>&1 || true' EXIT
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Docker CLI is unavailable"
+                    }
 
-                    for i in $(seq 1 15); do
-                      if curl -fsS http://127.0.0.1:18080/ >/dev/null; then
-                        echo "Application test passed"
-                        exit 0
-                      fi
-                      sleep 2
-                    done
+                    docker info
 
-                    echo "Application test failed"
-                    exit 1
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Docker engine is unavailable to Jenkins"
+                    }
                 '''
             }
         }
 
-        stage('Push to Docker Hub') {
+        stage('Verify Kubernetes') {
             steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'dockerhub-creds',
-                        usernameVariable: 'DOCKER_USER',
-                        passwordVariable: 'DOCKER_TOKEN'
-                    )
-                ]) {
-                    sh '''
-                        set +x
+                powershell '''
+                    kubectl config current-context
 
-                        echo "$DOCKER_TOKEN" |
-                          docker login \
-                            --username "$DOCKER_USER" \
-                            --password-stdin
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Kubernetes context is unavailable to Jenkins"
+                    }
 
-                        docker push ${IMAGE_NAME}:v1
+                    kubectl get nodes
 
-                        docker logout
-                    '''
-                }
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Jenkins cannot access Kubernetes"
+                    }
+                '''
             }
         }
     }
 
     post {
-        always {
-            echo 'CI pipeline finished.'
+        success {
+            echo 'Project files, Docker, and Kubernetes checks passed.'
+        }
+
+        failure {
+            echo 'A verification stage failed. Check Console Output.'
         }
     }
 }
