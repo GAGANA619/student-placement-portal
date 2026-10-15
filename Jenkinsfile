@@ -1,24 +1,22 @@
 pipeline {
     agent any
 
-    options {
-        timestamps()
-        disableConcurrentBuilds()
-    }
-
     parameters {
         booleanParam(
             name: 'DEMO_FAULTY_ROLLOUT',
             defaultValue: false,
-            description: 'Demonstrate a faulty deployment and automatic rollback'
+            description: 'Enable the faulty deployment and automatic rollback demonstration'
         )
     }
 
     environment {
-        IMAGE_NAME = 'YOUR-DOCKERHUB-USERNAME/student-placement-portal'
+        DOCKERHUB_USER = 'gagana6969'
+        IMAGE_NAME = 'gagana6969/student-placement-portal'
+
         DEPLOYMENT_NAME = 'student-placement-portal'
         SERVICE_NAME = 'student-placement-portal-service'
         CONTAINER_NAME = 'student-placement-portal'
+
         NAMESPACE = 'default'
         NODE_PORT = '30080'
     }
@@ -28,11 +26,7 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scm
-
-                powershell '''
-                    Write-Host "Repository checkout successful."
-                    Get-ChildItem -Force
-                '''
+                echo 'Source code checked out successfully.'
             }
         }
 
@@ -45,20 +39,19 @@ pipeline {
                         "Jenkinsfile"
                     )
 
+                    if ((Test-Path "Dockerfile") -eq $false -and
+                        (Test-Path "dockerfile") -eq $false) {
+                        throw "Dockerfile or dockerfile is missing."
+                    }
+
                     foreach ($file in $requiredFiles) {
                         if (!(Test-Path $file)) {
-                            throw "Required file is missing: $file"
+                            throw "Required file missing: $file"
                         }
-
                         Write-Host "Found: $file"
                     }
 
-                    if (!(Test-Path "Dockerfile") -and
-                        !(Test-Path "dockerfile")) {
-                        throw "Dockerfile is missing."
-                    }
-
-                    Write-Host "All required files are present."
+                    Write-Host "Project files verified."
                 '''
             }
         }
@@ -69,7 +62,7 @@ pipeline {
                     docker --version
 
                     if ($LASTEXITCODE -ne 0) {
-                        throw "Docker CLI is unavailable."
+                        throw "Docker CLI is not working."
                     }
 
                     docker info
@@ -78,7 +71,7 @@ pipeline {
                         throw "Docker Engine is unavailable."
                     }
 
-                    Write-Host "Docker Engine is accessible."
+                    Write-Host "Docker is ready."
                 '''
             }
         }
@@ -87,7 +80,7 @@ pipeline {
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'kubeconfig-file',
+                        credentialsId: 'kuberconfig',
                         variable: 'KUBECONFIG_FILE'
                     )
                 ]) {
@@ -97,16 +90,16 @@ pipeline {
                         kubectl config current-context
 
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Kubernetes context is unavailable in kubeconfig."
+                            throw "Kubernetes context could not be loaded from the Jenkins credential."
                         }
 
                         kubectl get nodes
 
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Cannot connect to Kubernetes API server."
+                            throw "Jenkins cannot connect to Kubernetes."
                         }
 
-                        Write-Host "Kubernetes access verified."
+                        Write-Host "Kubernetes connection verified."
                     '''
                 }
             }
@@ -115,20 +108,17 @@ pipeline {
         stage('Build Stable Image') {
             steps {
                 powershell '''
-                    $dockerfile = "Dockerfile"
-
-                    if (!(Test-Path $dockerfile)) {
-                        $dockerfile = "dockerfile"
-                    }
-
-                    docker build `
-                        -f $dockerfile `
-                        -t "$env:IMAGE_NAME`:v1" `
-                        .
-
+                    docker build -t "${env:IMAGE_NAME}:v1" .
                     if ($LASTEXITCODE -ne 0) {
                         throw "Stable Docker image build failed."
                     }
+
+                    docker tag "${env:IMAGE_NAME}:v1" "${env:IMAGE_NAME}:latest"
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Docker image tagging failed."
+                    }
+
+                    Write-Host "Stable image built successfully."
                 '''
             }
         }
@@ -136,49 +126,45 @@ pipeline {
         stage('Test Stable Image') {
             steps {
                 powershell '''
-                    $testName = "placement-ci-test-$env:BUILD_NUMBER"
+                    $existing = docker ps -aq --filter "name=placement-portal-test"
 
-                    docker rm -f $testName 2>$null
+                    if ($existing) {
+                        docker rm -f placement-portal-test
+                    }
 
                     docker run -d `
-                        --name $testName `
+                        --name placement-portal-test `
                         -p 18080:80 `
-                        "$env:IMAGE_NAME`:v1"
+                        "${env:IMAGE_NAME}:v1"
 
                     if ($LASTEXITCODE -ne 0) {
-                        throw "Unable to start the test container."
+                        throw "Could not start the stable test container."
+                    }
+
+                    Start-Sleep -Seconds 5
+
+                    $containerState = docker inspect `
+                        --format="{{.State.Running}}" placement-portal-test
+
+                    if ($containerState -ne "true") {
+                        docker logs placement-portal-test
+                        throw "Stable test container is not running."
                     }
 
                     try {
-                        $success = $false
+                        $response = Invoke-WebRequest `
+                            -Uri "http://localhost:18080" `
+                            -UseBasicParsing `
+                            -TimeoutSec 10
 
-                        for ($i = 0; $i -lt 15; $i++) {
-                            Start-Sleep -Seconds 2
-
-                            try {
-                                $response = Invoke-WebRequest `
-                                    -Uri "http://127.0.0.1:18080/" `
-                                    -UseBasicParsing `
-                                    -TimeoutSec 3
-
-                                if ($response.StatusCode -eq 200) {
-                                    $success = $true
-                                    break
-                                }
-                            }
-                            catch {
-                                Write-Host "Waiting for web server..."
-                            }
+                        if ($response.StatusCode -ne 200) {
+                            throw "Local webpage test failed."
                         }
 
-                        if (!$success) {
-                            throw "Stable application HTTP test failed."
-                        }
-
-                        Write-Host "Stable application returned HTTP 200."
+                        Write-Host "Local webpage returned HTTP 200."
                     }
                     finally {
-                        docker rm -f $testName 2>$null
+                        docker rm -f placement-portal-test
                     }
                 '''
             }
@@ -188,28 +174,31 @@ pipeline {
             steps {
                 withCredentials([
                     usernamePassword(
-                        credentialsId: 'dockerhub-creds',
-                        usernameVariable: 'DOCKER_USER',
-                        passwordVariable: 'DOCKER_TOKEN'
+                        credentialsId: 'dockerhub',
+                        usernameVariable: 'DOCKERHUB_USERNAME',
+                        passwordVariable: 'DOCKERHUB_TOKEN'
                     )
                 ]) {
                     powershell '''
-                        $env:DOCKER_TOKEN |
-                            docker login `
-                                --username $env:DOCKER_USER `
-                                --password-stdin
+                        $env:DOCKERHUB_TOKEN | docker login `
+                            --username $env:DOCKERHUB_USERNAME `
+                            --password-stdin
 
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Docker Hub authentication failed."
+                            throw "Docker Hub login failed."
                         }
 
-                        docker push "$env:IMAGE_NAME`:v1"
-
+                        docker push "${env:IMAGE_NAME}:v1"
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Docker Hub push failed."
+                            throw "Failed to push stable v1 image."
                         }
 
-                        docker logout
+                        docker push "${env:IMAGE_NAME}:latest"
+                        if ($LASTEXITCODE -ne 0) {
+                            throw "Failed to push latest image."
+                        }
+
+                        Write-Host "Stable images pushed to Docker Hub."
                     '''
                 }
             }
@@ -219,7 +208,7 @@ pipeline {
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'kubeconfig-file',
+                        credentialsId: 'kuberconfig',
                         variable: 'KUBECONFIG_FILE'
                     )
                 ]) {
@@ -227,26 +216,29 @@ pipeline {
                         $env:KUBECONFIG = $env:KUBECONFIG_FILE
 
                         kubectl apply -f deployment.yaml
-
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Applying Kubernetes configuration failed."
+                            throw "Applying deployment.yaml failed."
                         }
 
                         kubectl set image `
-                            "deployment/$env:DEPLOYMENT_NAME" `
-                            "$env:CONTAINER_NAME=$env:IMAGE_NAME`:v1"
+                            "deployment/${env:DEPLOYMENT_NAME}" `
+                            "${env:CONTAINER_NAME}=${env:IMAGE_NAME}:v1" `
+                            -n $env:NAMESPACE
 
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Updating the stable image failed."
+                            throw "Updating the deployment image failed."
                         }
 
                         kubectl rollout status `
-                            "deployment/$env:DEPLOYMENT_NAME" `
+                            "deployment/${env:DEPLOYMENT_NAME}" `
+                            -n $env:NAMESPACE `
                             --timeout=180s
 
                         if ($LASTEXITCODE -ne 0) {
                             throw "Stable deployment rollout failed."
                         }
+
+                        Write-Host "Stable release deployed."
                     '''
                 }
             }
@@ -256,39 +248,26 @@ pipeline {
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'kubeconfig-file',
+                        credentialsId: 'kuberconfig',
                         variable: 'KUBECONFIG_FILE'
                     )
                 ]) {
                     powershell '''
                         $env:KUBECONFIG = $env:KUBECONFIG_FILE
 
-                        kubectl get deployments
-                        kubectl get pods -l app=student-placement-portal
-                        kubectl get services
+                        kubectl get deployment $env:DEPLOYMENT_NAME -n $env:NAMESPACE
+                        kubectl get pods -n $env:NAMESPACE
+                        kubectl get service $env:SERVICE_NAME -n $env:NAMESPACE
 
-                        if ($LASTEXITCODE -ne 0) {
-                            throw "Unable to query Kubernetes resources."
+                        $ready = kubectl get deployment $env:DEPLOYMENT_NAME `
+                            -n $env:NAMESPACE `
+                            -o jsonpath="{.status.readyReplicas}"
+
+                        if ($LASTEXITCODE -ne 0 -or "$ready" -ne "2") {
+                            throw "Expected two ready replicas, but found: $ready"
                         }
 
-                        kubectl wait `
-                            --for=condition=available `
-                            "deployment/$env:DEPLOYMENT_NAME" `
-                            --timeout=120s
-
-                        if ($LASTEXITCODE -ne 0) {
-                            throw "Deployment did not become available."
-                        }
-
-                        $ready = kubectl get deployment `
-                            $env:DEPLOYMENT_NAME `
-                            -o jsonpath='{.status.readyReplicas}'
-
-                        if ($ready -ne "2") {
-                            throw "Expected two ready replicas; found $ready."
-                        }
-
-                        Write-Host "Both replicas are available."
+                        Write-Host "Both replicas are ready."
                     '''
                 }
             }
@@ -296,21 +275,17 @@ pipeline {
 
         stage('Build Faulty Image') {
             when {
-                expression {
-                    return params.DEMO_FAULTY_ROLLOUT
-                }
+                expression { params.DEMO_FAULTY_ROLLOUT }
             }
-
             steps {
                 powershell '''
                     if (!(Test-Path "Dockerfile.faulty")) {
-                        throw "Dockerfile.faulty is missing."
+                        throw "Dockerfile.faulty is missing. Create and commit it before enabling the rollback demonstration."
                     }
 
                     docker build `
                         -f Dockerfile.faulty `
-                        -t "$env:IMAGE_NAME`:faulty" `
-                        .
+                        -t "${env:IMAGE_NAME}:faulty" .
 
                     if ($LASTEXITCODE -ne 0) {
                         throw "Faulty image build failed."
@@ -321,36 +296,30 @@ pipeline {
 
         stage('Push Faulty Image') {
             when {
-                expression {
-                    return params.DEMO_FAULTY_ROLLOUT
-                }
+                expression { params.DEMO_FAULTY_ROLLOUT }
             }
-
             steps {
                 withCredentials([
                     usernamePassword(
-                        credentialsId: 'dockerhub-creds',
-                        usernameVariable: 'DOCKER_USER',
-                        passwordVariable: 'DOCKER_TOKEN'
+                        credentialsId: 'dockerhub',
+                        usernameVariable: 'DOCKERHUB_USERNAME',
+                        passwordVariable: 'DOCKERHUB_TOKEN'
                     )
                 ]) {
                     powershell '''
-                        $env:DOCKER_TOKEN |
-                            docker login `
-                                --username $env:DOCKER_USER `
-                                --password-stdin
+                        $env:DOCKERHUB_TOKEN | docker login `
+                            --username $env:DOCKERHUB_USERNAME `
+                            --password-stdin
 
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Docker Hub authentication failed."
+                            throw "Docker Hub login failed."
                         }
 
-                        docker push "$env:IMAGE_NAME`:faulty"
+                        docker push "${env:IMAGE_NAME}:faulty"
 
                         if ($LASTEXITCODE -ne 0) {
                             throw "Faulty image push failed."
                         }
-
-                        docker logout
                     '''
                 }
             }
@@ -358,15 +327,12 @@ pipeline {
 
         stage('Demonstrate Failed Rollout and Rollback') {
             when {
-                expression {
-                    return params.DEMO_FAULTY_ROLLOUT
-                }
+                expression { params.DEMO_FAULTY_ROLLOUT }
             }
-
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'kubeconfig-file',
+                        credentialsId: 'kuberconfig',
                         variable: 'KUBECONFIG_FILE'
                     )
                 ]) {
@@ -375,87 +341,85 @@ pipeline {
 
                         $previousImage = kubectl get deployment `
                             $env:DEPLOYMENT_NAME `
-                            -o jsonpath='{.spec.template.spec.containers[0].image}'
+                            -n $env:NAMESPACE `
+                            -o jsonpath="{.spec.template.spec.containers[0].image}"
 
                         if ($LASTEXITCODE -ne 0 -or !$previousImage) {
-                            throw "Cannot identify the current deployment image."
+                            throw "Could not determine the current deployment image."
                         }
 
-                        Write-Host "Previous image: $previousImage"
+                        Write-Host "Previous stable image: $previousImage"
 
-                        if ($previousImage -ne "$env:IMAGE_NAME`:v1") {
-                            throw "Expected the stable v1 image before failure demonstration."
+                        if ($previousImage -ne "${env:IMAGE_NAME}:v1") {
+                            throw "Expected stable v1 before rollback demo. Current image: $previousImage"
                         }
 
                         kubectl set image `
-                            "deployment/$env:DEPLOYMENT_NAME" `
-                            "$env:CONTAINER_NAME=$env:IMAGE_NAME`:faulty"
+                            "deployment/${env:DEPLOYMENT_NAME}" `
+                            "${env:CONTAINER_NAME}=${env:IMAGE_NAME}:faulty" `
+                            -n $env:NAMESPACE
 
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Unable to submit faulty rollout."
+                            throw "Could not apply the faulty image."
                         }
 
+                        Write-Host "Waiting for the faulty rollout to fail..."
+
                         kubectl rollout status `
-                            "deployment/$env:DEPLOYMENT_NAME" `
+                            "deployment/${env:DEPLOYMENT_NAME}" `
+                            -n $env:NAMESPACE `
                             --timeout=90s
 
                         $rolloutExitCode = $LASTEXITCODE
 
                         if ($rolloutExitCode -eq 0) {
-                            Write-Host "Faulty rollout unexpectedly succeeded."
-
-                            kubectl rollout undo `
-                                "deployment/$env:DEPLOYMENT_NAME"
-
-                            kubectl rollout status `
-                                "deployment/$env:DEPLOYMENT_NAME" `
-                                --timeout=180s
-
-                            throw "Failure demonstration invalid: faulty rollout succeeded."
+                            throw "The faulty rollout unexpectedly succeeded. Rollback demonstration is inconclusive."
                         }
 
                         Write-Host "Faulty rollout failed as expected."
-                        Write-Host "Starting automatic rollback."
+                        Write-Host "Automatically rolling back to the previous release..."
 
                         kubectl rollout undo `
-                            "deployment/$env:DEPLOYMENT_NAME"
+                            "deployment/${env:DEPLOYMENT_NAME}" `
+                            -n $env:NAMESPACE
 
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Rollback command failed."
+                            throw "Kubernetes rollback command failed."
                         }
 
                         kubectl rollout status `
-                            "deployment/$env:DEPLOYMENT_NAME" `
+                            "deployment/${env:DEPLOYMENT_NAME}" `
+                            -n $env:NAMESPACE `
                             --timeout=180s
 
                         if ($LASTEXITCODE -ne 0) {
-                            throw "Stable rollout was not restored."
+                            throw "The restored deployment did not become ready."
                         }
 
                         $restoredImage = kubectl get deployment `
                             $env:DEPLOYMENT_NAME `
-                            -o jsonpath='{.spec.template.spec.containers[0].image}'
+                            -n $env:NAMESPACE `
+                            -o jsonpath="{.spec.template.spec.containers[0].image}"
 
                         if ($restoredImage -ne $previousImage) {
-                            throw "The previous stable image was not restored."
+                            throw "Rollback image mismatch. Expected $previousImage but found $restoredImage"
                         }
 
                         $ready = kubectl get deployment `
                             $env:DEPLOYMENT_NAME `
-                            -o jsonpath='{.status.readyReplicas}'
+                            -n $env:NAMESPACE `
+                            -o jsonpath="{.status.readyReplicas}"
 
-                        if ($ready -ne "2") {
-                            throw "Rollback completed but two replicas are not ready."
+                        if ($LASTEXITCODE -ne 0 -or "$ready" -ne "2") {
+                            throw "Rollback completed, but two replicas are not ready."
                         }
 
-                        kubectl get deployments
-                        kubectl get pods -l app=student-placement-portal
+                        kubectl get pods -n $env:NAMESPACE
                         kubectl rollout history `
-                            "deployment/$env:DEPLOYMENT_NAME"
+                            "deployment/${env:DEPLOYMENT_NAME}" `
+                            -n $env:NAMESPACE
 
-                        Write-Host "Automatic rollback verified."
-                        Write-Host "Stable image restored: $restoredImage"
-                        Write-Host "Ready replicas: $ready"
+                        Write-Host "SUCCESS: Previous stable release restored with two ready replicas."
                     '''
                 }
             }
@@ -464,15 +428,15 @@ pipeline {
 
     post {
         success {
-            echo 'Pipeline completed successfully.'
+            echo 'PIPELINE SUCCESS: Student Placement Portal CI/CD stages completed.'
         }
 
         failure {
-            echo 'Pipeline failed. Review the first failing stage in Console Output.'
+            echo 'PIPELINE FAILED: Open Console Output and inspect the first failing stage.'
         }
 
         always {
-            echo 'Student Placement Portal CI/CD pipeline finished.'
+            echo 'Student Placement Portal pipeline finished.'
         }
     }
 }
